@@ -1,0 +1,221 @@
+
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+const $ = id => document.getElementById(id);
+const statusEl = $('status');
+let D, session, plans = [], sel = 0, view = '2d', token = 0;
+let N, DX;
+const ZCOL = ['#6f8fd8', '#e0a458', '#6bbf8a', '#c97bb2', '#d86f6f'];
+
+
+const VIR = [[68, 1, 84], [59, 82, 139], [33, 145, 140], [94, 201, 98], [253, 231, 37]];
+function ramp(t, stops = VIR) {
+    t = Math.min(1, Math.max(0, t)); const s = t * (stops.length - 1), i = Math.min(stops.length - 2, Math.floor(s)), f = s - i;
+    return stops[i].map((v, j) => Math.round(v + (stops[i + 1][j] - v) * f));
+}
+const COST = [[70, 130, 220], [255, 180, 84], [235, 90, 90]];
+const dustT = c => (Math.log10(Math.max(c, 1e-6)) + 2) / 4;
+function drawBar(canvas, stops) {
+    const g = canvas.getContext('2d');
+    for (let x = 0; x < canvas.width; x++) { const c = ramp(x / (canvas.width - 1), stops); g.fillStyle = `rgb(${c})`; g.fillRect(x, 0, 1, canvas.height); }
+}
+
+const b64 = s => Uint8Array.from(atob(s), c => c.charCodeAt(0));
+function unpack(p) { if (!p.fl) { p.fl = b64(p.flags); p.zn = b64(p.zone); } return p; }
+
+async function predict(plan, K) {
+    unpack(plan);
+    const n = N * N, x = new Float32Array(12 * n);
+    const kch = (Math.log10(K) + 1.7) / 1.4;
+    for (let i = 0; i < n; i++) {
+        const f = plan.fl[i];
+        x[i] = f & 1 ? 1 : 0; x[n + i] = f & 2 ? 1 : 0; x[2 * n + i] = f & 4 ? 1 : 0;
+        x[3 * n + i] = f & 8 ? 1 : 0; x[4 * n + i] = f & 16 ? 1 : 0; x[5 * n + i] = f & 32 ? 1 : 0;
+        const z = plan.zn[i]; if (z > 0) x[(5 + z) * n + i] = 1;
+        x[11 * n + i] = kch;
+    }
+    const out = await session.run({ x: new ort.Tensor('float32', x, [1, 12, N, N]) });
+    const y = out.y.data, c = new Float32Array(n), zs = new Float64Array(5), zc = new Int32Array(5);
+    for (let i = 0; i < n; i++) {
+        if (!(plan.fl[i] & 1)) { c[i] = NaN; continue; }
+        c[i] = Math.pow(10, y[i] * D.SD + D.MU);
+        const z = plan.zn[i]; if (z > 0) { zs[z - 1] += c[i]; zc[z - 1]++; }
+    }
+    return { c, zone: Array.from(zs, (s, i) => s / Math.max(zc[i], 1)) };
+}
+
+const pc = $('pareto'), pg = pc.getContext('2d');
+const PAD = { l: 52, r: 12, t: 12, b: 42 };
+let ax;
+function setupAxes() {
+    const f1 = plans.map(p => p.ft[0]), f2 = plans.map(p => p.ft[1]);
+    ax = {
+        x0: Math.log10(Math.min(...f2) * 0.85), x1: Math.log10(Math.max(...f2) * 1.15),
+        y0: Math.log10(Math.min(...f1) * 0.85), y1: Math.log10(Math.max(...f1) * 1.15)
+    };
+}
+const px = v => PAD.l + (Math.log10(v) - ax.x0) / (ax.x1 - ax.x0) * (pc.width - PAD.l - PAD.r);
+const py = v => pc.height - PAD.b - (Math.log10(v) - ax.y0) / (ax.y1 - ax.y0) * (pc.height - PAD.t - PAD.b);
+function drawPareto() {
+    pg.clearRect(0, 0, pc.width, pc.height); pg.font = '11px system-ui'; pg.fillStyle = '#9aa4b5'; pg.strokeStyle = '#2a3140';
+    const ticks = [1, 1.5, 2, 3, 4, 6];
+    pg.textAlign = 'center';
+    for (const t of ticks) { const X = px(t); if (X < PAD.l || X > pc.width - PAD.r) continue; pg.beginPath(); pg.moveTo(X, PAD.t); pg.lineTo(X, pc.height - PAD.b); pg.stroke(); pg.fillText(t, X, pc.height - PAD.b + 14); }
+    pg.textAlign = 'right';
+    for (const t of ticks) { const Y = py(t); if (Y < PAD.t || Y > pc.height - PAD.b) continue; pg.beginPath(); pg.moveTo(PAD.l, Y); pg.lineTo(pc.width - PAD.r, Y); pg.stroke(); pg.fillText(t, PAD.l - 6, Y + 3); }
+    pg.textAlign = 'center'; pg.fillText('f2: пил в їдальні / спорті / роботі, мг/м³', (PAD.l + pc.width - PAD.r) / 2, pc.height - 6);
+    pg.save(); pg.translate(12, (PAD.t + pc.height - PAD.b) / 2); pg.rotate(-Math.PI / 2); pg.fillText('f1: пил у спальні + гігієні, мг/м³', 0, 0); pg.restore();
+    plans.forEach((p, i) => {
+        const c = ramp((p.ft[3] - 1) / 2.5, COST);
+        pg.beginPath(); pg.arc(px(p.ft[1]), py(p.ft[0]), i === sel ? 7 : 4.5, 0, 7);
+        pg.fillStyle = `rgba(${c},${i === sel ? 1 : 0.8})`; pg.fill();
+        pg.lineWidth = i === sel ? 2.5 : 0.6; pg.strokeStyle = i === sel ? '#fff' : 'rgba(0,0,0,.6)'; pg.stroke(); pg.lineWidth = 1;
+    });
+}
+pc.addEventListener('click', e => {
+    const r = pc.getBoundingClientRect(), mx = (e.clientX - r.left) * pc.width / r.width, my = (e.clientY - r.top) * pc.height / r.height;
+    let best = -1, bd = 14 * 14;
+    plans.forEach((p, i) => { const d = (px(p.ft[1]) - mx) ** 2 + (py(p.ft[0]) - my) ** 2; if (d < bd) { bd = d; best = i; } });
+    if (best >= 0) select(best);
+});
+
+const mc = $('map2d'), mg = mc.getContext('2d');
+let cur = null;
+function draw2D() {
+    if (!cur) return; const p = plans[sel], n = N, s = mc.width / n;
+    const img = mg.createImageData(mc.width, mc.height);
+    for (let y = 0; y < mc.height; y++) for (let x = 0; x < mc.width; x++) {
+        const i = Math.floor(y / s) * n + Math.floor(x / s), v = cur.c[i], o = (y * mc.width + x) * 4;
+        if (isNaN(v)) { img.data[o] = 38; img.data[o + 1] = 42; img.data[o + 2] = 52; } else { const c = ramp(dustT(v)); img.data[o] = c[0]; img.data[o + 1] = c[1]; img.data[o + 2] = c[2]; }
+        img.data[o + 3] = 255;
+    }
+    mg.putImageData(img, 0, 0);
+    mg.font = '12px system-ui'; mg.textAlign = 'center';
+    for (let z = 1; z <= 5; z++) {
+        let x0 = n, y0 = n, x1 = -1, y1 = -1;
+        for (let i = 0; i < n * n; i++) if (p.zn[i] === z) { const x = i % n, y = (i / n) | 0; x0 = Math.min(x0, x); x1 = Math.max(x1, x); y0 = Math.min(y0, y); y1 = Math.max(y1, y); }
+        mg.strokeStyle = 'rgba(255,255,255,.85)'; mg.setLineDash([4, 3]); mg.strokeRect(x0 * s, y0 * s, (x1 - x0 + 1) * s, (y1 - y0 + 1) * s); mg.setLineDash([]);
+        mg.fillStyle = '#000'; mg.fillText(D.zones[z - 1], (x0 + x1 + 1) / 2 * s + 1, (y0 + y1 + 1) / 2 * s + 1);
+        mg.fillStyle = '#fff'; mg.fillText(D.zones[z - 1], (x0 + x1 + 1) / 2 * s, (y0 + y1 + 1) / 2 * s);
+    }
+
+    for (let i = 0; i < n * n; i++) {
+        const f = p.fl[i], x = (i % n + 0.5) * s, y = (((i / n) | 0) + 0.5) * s;
+        if (f & 2) mark(x, y, '▲', '#4ea1ff'); if (f & 4) mark(x, y, '▼', '#ff5c5c'); if (f & 8) mark(x, y, '◆', '#c58bff');
+    }
+}
+function mark(x, y, ch, col) { mg.font = 'bold 18px system-ui'; mg.fillStyle = '#000'; mg.fillText(ch, x + 1, y + 7); mg.fillStyle = col; mg.fillText(ch, x, y + 6); }
+
+
+let T = null;
+function init3D() {
+    if (T) return; const canvas = $('three');
+    const renderer = new THREE.WebGLRenderer({ canvas, antialias: true }); renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+    const scene = new THREE.Scene(); scene.background = new THREE.Color(0x0b0e13);
+    const camera = new THREE.PerspectiveCamera(45, 1, 0.1, 100); camera.position.set(7, 9, 9);
+    const controls = new OrbitControls(camera, canvas); controls.target.set(0, 0.5, 0); controls.enableDamping = true;
+    scene.add(new THREE.AmbientLight(0xffffff, 0.7)); const dl = new THREE.DirectionalLight(0xffffff, 0.8); dl.position.set(5, 10, 4); scene.add(dl);
+    const size = N * DX; const tex = new THREE.DataTexture(new Uint8Array(N * N * 4), N, N, THREE.RGBAFormat); tex.magFilter = THREE.NearestFilter; tex.minFilter = THREE.NearestFilter; tex.needsUpdate = true;
+    const floor = new THREE.Mesh(new THREE.PlaneGeometry(size, size), new THREE.MeshBasicMaterial({ map: tex })); floor.rotation.x = -Math.PI / 2; scene.add(floor);
+    const grp = new THREE.Group(); scene.add(grp);
+    T = { renderer, scene, camera, controls, tex, grp, size };
+    const resize = () => { const w = canvas.clientWidth; if (!w) return; renderer.setSize(w, w, false); camera.aspect = 1; camera.updateProjectionMatrix(); };
+    addEventListener('resize', resize); T.resize = resize;
+    (function loop() { requestAnimationFrame(loop); if (view !== '3d') return; controls.update(); renderer.render(scene, camera); })();
+}
+function update3D() {
+    if (!T || !cur) return; const p = plans[sel], n = N, half = T.size / 2;
+    const d = T.tex.image.data;
+    for (let i = 0; i < n * n; i++) {
+        const v = cur.c[i], c = isNaN(v) ? [0, 0, 0] : ramp(dustT(v)); d[4 * i] = c[0]; d[4 * i + 1] = c[1]; d[4 * i + 2] = c[2]; d[4 * i + 3] = isNaN(v) ? 0 : 255;
+    }
+    T.tex.needsUpdate = true;
+    T.grp.traverse(o => { if (o.geometry) o.geometry.dispose(); }); T.grp.clear();
+    const X = i => (i % n + 0.5) * DX - half, Z = i => (((i / n) | 0) + 0.5) * DX - half;
+    const part = [], shell = [];
+    for (let i = 0; i < n * n; i++) {
+        if (p.fl[i] & 1) continue; const x = i % n - n / 2 + 0.5, y = ((i / n) | 0) - n / 2 + 0.5, r2 = x * x + y * y;
+        if (r2 <= 20.5 ** 2) part.push(i); else if (r2 <= 22.5 ** 2) shell.push(i);
+    }
+    const m = new THREE.Matrix4();
+    const wm = new THREE.InstancedMesh(new THREE.BoxGeometry(DX, 2.2, DX), new THREE.MeshStandardMaterial({ color: 0x8892a6 }), part.length);
+    part.forEach((i, k) => { m.setPosition(X(i), 1.1, Z(i)); wm.setMatrixAt(k, m); }); T.grp.add(wm);
+    const sm = new THREE.InstancedMesh(new THREE.BoxGeometry(DX, 0.5, DX), new THREE.MeshStandardMaterial({ color: 0x5b6475 }), shell.length);
+    shell.forEach((i, k) => { m.setPosition(X(i), 0.25, Z(i)); sm.setMatrixAt(k, m); }); T.grp.add(sm);
+    for (let z = 1; z <= 5; z++) {
+        let x0 = n, y0 = n, x1 = -1, y1 = -1;
+        for (let i = 0; i < n * n; i++) if (p.zn[i] === z) { const x = i % n, y = (i / n) | 0; x0 = Math.min(x0, x); x1 = Math.max(x1, x); y0 = Math.min(y0, y); y1 = Math.max(y1, y); }
+        const w = (x1 - x0 + 1) * DX, h = (y1 - y0 + 1) * DX;
+        const b = new THREE.Mesh(new THREE.BoxGeometry(w, 0.9, h), new THREE.MeshStandardMaterial({ color: ZCOL[z - 1], transparent: true, opacity: 0.35 }));
+        b.position.set((x0 + x1 + 1) / 2 * DX - half, 0.45, (y0 + y1 + 1) / 2 * DX - half); T.grp.add(b);
+    }
+
+    const al = []; for (let i = 0; i < n * n; i++) if (p.fl[i] & 32) al.push(i);
+    const am = new THREE.InstancedMesh(new THREE.BoxGeometry(DX, 2.0, DX), new THREE.MeshStandardMaterial({ color: 0xc58bff, transparent: true, opacity: 0.18 }), al.length);
+    al.forEach((i, k) => { m.setPosition(X(i), 1.0, Z(i)); am.setMatrixAt(k, m); }); T.grp.add(am);
+    for (let i = 0; i < n * n; i++) {
+        const f = p.fl[i]; if (!(f & 14)) continue;
+        const col = f & 2 ? 0x4ea1ff : f & 4 ? 0xff5c5c : 0xc58bff;
+        const s = new THREE.Mesh(new THREE.ConeGeometry(0.18, 0.4, 12), new THREE.MeshStandardMaterial({ color: col })); s.position.set(X(i), 2.3, Z(i)); if (f & 2) s.rotation.x = Math.PI; T.grp.add(s);
+    }
+    const dome = new THREE.Mesh(new THREE.SphereGeometry(22 * DX, 32, 12, 0, Math.PI * 2, 0, Math.PI / 2), new THREE.MeshBasicMaterial({ color: 0x9fb4d8, wireframe: true, transparent: true, opacity: 0.18 }));
+    dome.scale.y = 0.6; T.grp.add(dome);
+}
+
+const kFromSlider = v => Math.exp(Math.log(0.02) + (Math.log(0.5) - Math.log(0.02)) * v / 1000);
+const fmt = (v, d = 2) => Number(v).toFixed(d).replace('.', ',');
+function renderInfo() {
+    const p = plans[sel];
+    $('info').innerHTML = [
+        ['Ступенів шлюзу', p.stages], ['Витяжка в шлюзі', p.exh ? 'є' : 'немає'], ['Подач повітря', p.nsup], ['Перегородки', p.parts.length ? p.parts.join(', ') : 'немає'],
+        ['Площа / об\'єм', `${fmt(p.area, 0)} м² / ${fmt(p.vol, 0)} м³`],
+        ['f1 прогноз U-Net', fmt(p.fs[0]) + ' мг/м³'], ['f1 перевірено', fmt(p.ft[0]) + ' мг/м³'],
+        ['f2 прогноз U-Net', fmt(p.fs[1]) + ' мг/м³'], ['f2 перевірено', fmt(p.ft[1]) + ' мг/м³'],
+        ['Шлях екіпажу (сер.)', fmt(p.ft[2], 1) + ' м'], ['Вартість шлюзу', fmt(p.ft[3], 1)],
+    ].map(([a, b]) => `<span>${a}</span><span>${b}</span>`).join('');
+}
+function renderBars() {
+    const lim = 0.3, mx = Math.max(10, ...cur.zone, lim) * 1.05, pos = v => 100 * (Math.log10(v) + 2) / (Math.log10(mx) + 2);
+    $('bars').innerHTML = D.zones.map((z, i) => {
+        const v = cur.zone[i];
+        return `<div class="bar"><span><i style="display:inline-block;width:9px;height:9px;background:${ZCOL[i]};border-radius:2px;margin-right:5px"></i>${z}</span>
+      <div class="track"><div class="fill" style="width:${Math.max(1, pos(Math.max(v, 0.01)))}%"></div><div class="lim" style="left:${pos(lim)}%"></div></div><b>${fmt(v)} мг/м³</b></div>`;
+    }).join('');
+}
+async function refresh() {
+    const my = ++token, K = kFromSlider(+$('k').value); $('kval').textContent = fmt(K, 3);
+    const r = await predict(plans[sel], K); if (my !== token) return;
+    cur = r; draw2D(); renderBars(); if (T) update3D();
+}
+function select(i) { sel = i; drawPareto(); renderInfo(); refresh(); }
+function setView(v) {
+    view = v; $('b2d').classList.toggle('on', v === '2d'); $('b3d').classList.toggle('on', v === '3d');
+    $('map2d').style.display = v === '2d' ? 'block' : 'none'; $('three').style.display = v === '3d' ? 'block' : 'none';
+    if (v === '3d') { init3D(); T.resize(); update3D(); }
+}
+$('b2d').onclick = () => setView('2d'); $('b3d').onclick = () => setView('3d');
+$('k').oninput = refresh;
+
+function presets() {
+    const idxBy = f => plans.reduce((b, p, i) => f(p) < f(plans[b]) ? i : b, 0);
+    const defs = [['Найчистіша спальня', () => idxBy(p => p.ft[0])], ['Найчистіші інші зони', () => idxBy(p => p.ft[1])],
+    ['Найдешевший шлюз', () => idxBy(p => p.ft[3] * 100 + p.ft[0])], ['Найкоротший шлях', () => idxBy(p => p.ft[2])]];
+    $('presets').innerHTML = ''; defs.forEach(([t, f]) => { const b = document.createElement('button'); b.textContent = t; b.onclick = () => select(f()); $('presets').appendChild(b); });
+}
+
+(async function main() {
+    try {
+        drawBar($('dustbar'), VIR); drawBar($('costbar'), COST); $('costlbl').textContent = '1 → 3,5';
+        D = await (await fetch('data.json')).json(); N = D.N; DX = D.DX; plans = D.plans;
+        statusEl.textContent = 'Завантаження моделі U-Net (ONNX)…';
+        session = await ort.InferenceSession.create('unet.onnx', { executionProviders: ['wasm'] });
+        setupAxes(); presets();
+        sel = plans.reduce((b, p, i) => p.ft[0] < plans[b].ft[0] ? i : b, 0);
+        $('k').value = 0; select(sel);
+        statusEl.textContent = `${plans.length} планів на фронті; модель працює в браузері. Тестова точність U-Net: R² ≈ ${fmt(D.metrics.R2_log)}.`;
+    } catch (e) {
+        statusEl.innerHTML = 'Помилка: ' + e.message + '<br>Відкривай сторінку через локальний сервер (<code>python -m http.server</code> у папці web), а не подвійним кліком по файлу.';
+        console.error(e);
+    }
+})();
